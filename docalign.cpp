@@ -108,6 +108,12 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 	return queue_lines(fin, queue, skip_rate);
 }
 
+void merge(std::unordered_map<NGram,size_t> &df, std::unordered_map<NGram, size_t> const &local_df, size_t df_sample_rate) {
+	for (auto const &entry : local_df) {
+		df[entry.first] += entry.second * df_sample_rate;
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	unsigned int n_threads = thread::hardware_concurrency();
@@ -205,14 +211,10 @@ int main(int argc, char *argv[])
 					for (auto const &entry : document.vocab)
 						local_df[entry.first] += 1; // Count once every document
 				}
-			}
 
-			// Merge the local DF into the global one. Multiply by df_sample_rate
-			// to compensate for reading only nth part of the whole collection.
-			{
 				unique_lock<mutex> lock(df_mutex);
-				for (auto const &entry : local_df)
-					df[entry.first] += entry.second * df_sample_rate;
+				merge(df, local_df, df_sample_rate);
+				local_df.clear();
 			}
 		}));
 
