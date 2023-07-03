@@ -1,11 +1,10 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
-#include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <memory>
-#include <mutex>
 #include <vector>
 #include <cmath>
 #include <boost/program_options.hpp>
@@ -29,6 +28,15 @@ struct DocumentPair {
 	size_t in_idx;
 	size_t en_idx;
 };
+
+struct DocumentNGramScore {
+	size_t doc_id;
+	float tfidf;
+};
+
+constexpr size_t QUEUE_SIZE_PER_THREAD = 32;
+
+constexpr size_t BATCH_SIZE = 512;
 
 /**
  * Utility to start N threads executing fun. Returns a vector with those thread objects.
@@ -55,35 +63,46 @@ template <typename T> void stop(blocking_queue<unique_ptr<T>> &queue, vector<thr
 
 ostream &operator<<(ostream &out, queue_performance const &performance) {
 	return out << "  underflow: " << performance.underflow << '\n'
-	           << "   overflow: " << performance.overflow << '\n';
+			   << "   overflow: " << performance.overflow << '\n';
 }
 
 void print_score(float score, size_t left_id, size_t right_id)
 {
 	cout << fixed << setprecision(5)
-	     << score
-	     << '\t' << left_id
-	     << '\t' << right_id
-	     << '\n';
+		 << score
+		 << '\t' << left_id
+		 << '\t' << right_id
+		 << '\n';
 }
 
-size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<Line>> &queue, size_t skip_rate = 1)
+size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
 {
 	size_t document_count = 0;
-	for (StringPiece line : fin) {
-		if (document_count++ % skip_rate)
-			continue;
 
-		queue.push(unique_ptr<Line>(new Line{
-			.str = string(line.data(), line.size()),
-			.n = document_count
-		}));
+	auto it = fin.begin();
+
+	while (it != fin.end()) {
+		unique_ptr<vector<Line>> line_batch(new vector<Line>());
+		line_batch->reserve(BATCH_SIZE);
+
+		for (size_t i = 0; i < BATCH_SIZE; ++i) {
+			if (document_count++ % skip_rate == 0)
+				line_batch->push_back({
+					.str = string(it->data(), it->size()),
+					.n = document_count
+				});
+
+			if (++it == fin.end())
+				break;
+		}
+
+		queue.push(std::move(line_batch));
 	}
 
 	return document_count;
 }
 
-size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<Line>> &queue, size_t skip_rate = 1)
+size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
 {
 	util::FilePiece fin(path.c_str());
 	return queue_lines(fin, queue, skip_rate);
@@ -143,8 +162,8 @@ int main(int argc, char *argv[])
 	
 	if (vm.count("help") || !vm.count("translated-tokens") || !vm.count("english-tokens")) {
 		cout << "Usage: " << argv[0]
-		     << " TRANSLATED-TOKENS ENGLISH-TOKENS\n\n"
-		     << generic_desc << endl;
+			 << " TRANSLATED-TOKENS ENGLISH-TOKENS\n\n"
+			 << generic_desc << endl;
 		return 1;
 	}
 
@@ -152,7 +171,12 @@ int main(int argc, char *argv[])
 
 	unsigned int n_load_threads = n_threads;
 
-	unsigned int n_read_threads = min(n_threads, min(max(n_threads / 4u, 1u), 4u)); // really no use to have more than 4 threads decode
+	// Note: I've tried many heuristics for the number of reading threads, but
+	// my conclusion was that I either have too few and the scoring threads are
+	// waiting, or the queue is filled and the reading threads are blocking
+	// anyway. On desktop (macOS) just using maximum threads everywhere was
+	// always the fastest.
+	unsigned int n_read_threads = n_threads;
 
 	unsigned int n_score_threads = n_threads;
 	
@@ -160,24 +184,27 @@ int main(int argc, char *argv[])
 	// that parse documents and keep a local hash table for counting. At the
 	// end these tables are merged into df.
 	unordered_map<NGram,size_t> df;
+	unordered_set<NGram> max_ngram_pruned;
 	size_t in_document_cnt, en_document_cnt, document_cnt;
 
 	{
 		mutex df_mutex;
-		blocking_queue<unique_ptr<Line>> queue(n_sample_threads * 128);
+		blocking_queue<unique_ptr<vector<Line>>> queue(n_sample_threads * QUEUE_SIZE_PER_THREAD);
 		vector<thread> workers(start(n_sample_threads, [&queue, &df, &df_mutex, &ngram_size, &df_sample_rate]() {
 			unordered_map<NGram, size_t> local_df;
 
 			while (true) {
-				unique_ptr<Line> line(queue.pop());
+				unique_ptr<vector<Line>> line_batch(queue.pop());
 
-				if (!line)
+				if (!line_batch)
 					break;
 
-				Document document;
-				ReadDocument(line->str, document, ngram_size);
-				for (auto const &entry : document.vocab)
-					local_df[entry.first] += 1; // Count once every document
+				for (Line const &line : *line_batch) {
+					Document document;
+					ReadDocument(line.str, document, ngram_size);
+					for (auto const &entry : document.vocab)
+						local_df[entry.first] += 1; // Count once every document
+				}
 			}
 
 			// Merge the local DF into the global one. Multiply by df_sample_rate
@@ -216,47 +243,87 @@ int main(int argc, char *argv[])
 			if (entry.second < min_ngram_cnt)
 				continue;
 
-			if (entry.second > max_ngram_cnt)
+			if (entry.second > max_ngram_cnt) {
+				max_ngram_pruned.insert(entry.first);
 				continue;
+			}
 
 			pruned_df[entry.first] = entry.second;
 		}
 
-		if (verbose)
-			cerr << "Pruned " << df.size() - pruned_df.size() << " (" << 100.0 - 100.0 * pruned_df.size() / df.size() << "%) entries from DF" << endl;
+		if (verbose) {
+            cerr << "Pruned " << df.size() - pruned_df.size() << " (" << 100.0 - 100.0 * pruned_df.size() / df.size()
+                 << "%) entries from DF" << endl;
+            cerr << "Very frequent ngram set is now " << max_ngram_pruned.size() << " long." << endl;
+        }
 
 		swap(df, pruned_df);
 	}
 
 	// Read translated documents & pre-calculate TF/DF for each of these documents
-	std::vector<DocumentRef> refs(in_document_cnt);
-
+	unordered_map<NGram, vector<DocumentNGramScore>> ref_index;
+	
 	{
-		blocking_queue<unique_ptr<Line>> queue(n_load_threads * 128);
-		vector<thread> workers(start(n_load_threads, [&queue, &refs, &df, &document_cnt, &ngram_size]() {
-			while (true) {
-				unique_ptr<Line> line(queue.pop());
+		mutex ref_index_mutex;
 
-				if (!line)
+		blocking_queue<unique_ptr<vector<Line>>> queue(n_load_threads * QUEUE_SIZE_PER_THREAD);
+		vector<thread> workers(start(n_load_threads, [&queue, &ref_index, &ref_index_mutex, &df, &max_ngram_pruned, &document_cnt, &ngram_size]() {
+			unordered_map<NGram, vector<DocumentNGramScore>> local_ref_index;
+
+			while (true) {
+				unique_ptr<vector<Line>> line_batch(queue.pop());
+
+				if (!line_batch)
 					break;
 
-				Document doc{.id = line->n, .vocab = {}};
-				ReadDocument(line->str, doc, ngram_size);
+				for (Line const &line : *line_batch) {
+					Document doc{.id = line.n, .vocab = {}};
+					ReadDocument(line.str, doc, ngram_size);
 
-				// Note that each worker writes to a different line in the refs
-				// vector and the vector has been initialized with enough lines
-				// so there should be no concurrency issue.
-				// DF is accessed read-only. N starts counting at 1.
-				calculate_tfidf(doc, refs[line->n - 1], document_cnt, df);
+					// Note that each worker writes to a different line in the refs
+					// vector and the vector has been initialized with enough lines
+					// so there should be no concurrency issue.
+					// DF is accessed read-only. N starts counting at 1.
+					DocumentRef ref;
+					calculate_tfidf(doc, ref, document_cnt, df, max_ngram_pruned);
+
+					for (auto const &entry : ref.wordvec) {
+						local_ref_index[entry.hash].push_back(DocumentNGramScore{
+							.doc_id = line.n,
+							.tfidf = entry.tfidf
+						});
+					}
+				}
+			}
+
+			{
+				// Merge the local index we built into the global one
+				unique_lock<mutex> lock(ref_index_mutex);
+				for (auto &entry : local_ref_index) {
+					auto &dest = ref_index[entry.first];
+
+					// Minor optimisation: copy the fewest elements possible
+					if (dest.size() < entry.second.size())
+						swap(dest, entry.second);
+
+					dest.reserve(dest.size() + entry.second.size());
+					
+					move(entry.second.begin(), entry.second.end(), back_inserter(dest));
+				}
 			}
 		}));
 
-		queue_lines(vm["translated-tokens"].as<std::string>(), queue);
+		size_t refs_cnt = queue_lines(vm["translated-tokens"].as<std::string>(), queue);
 
+		UTIL_THROW_IF(refs_cnt != in_document_cnt, util::Exception, "Line count changed"
+			<< " from " << in_document_cnt << " to " << refs_cnt
+			<< " while reading " << vm["translated-tokens"].as<std::string>() 
+			<< " in a second pass.");
+		
 		stop(queue, workers);
 
 		if (verbose)
-			cerr << "Read " << refs.size() << " documents into memory" << endl;
+			cerr << "Read " << refs_cnt << " documents into memory" << endl;
 
 		if (verbose)
 			cerr << "Load queue performance:\n" << queue.performance();
@@ -264,69 +331,91 @@ int main(int argc, char *argv[])
 
 	// Start reading the other set of documents we match against and do the matching.
 	{
-		blocking_queue<unique_ptr<Line>> read_queue(n_read_threads * 128);
+		blocking_queue<unique_ptr<vector<Line>>> read_queue(n_read_threads * QUEUE_SIZE_PER_THREAD);
 
-		blocking_queue<unique_ptr<DocumentRef>> score_queue(n_score_threads * 256);
+		blocking_queue<unique_ptr<vector<DocumentRef>>> score_queue(n_score_threads * QUEUE_SIZE_PER_THREAD);
 
-		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &ngram_size]() {
+		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &max_ngram_pruned, &ngram_size]() {
 			while (true) {
-				unique_ptr<Line> line(read_queue.pop());
+				unique_ptr<vector<Line>> line_batch(read_queue.pop());
 
 				// Empty pointer is poison
-				if (!line)
+				if (!line_batch)
 					break;
 
-				Document doc{.id = line->n, .vocab = {}};
-				ReadDocument(line->str, doc, ngram_size);
+				unique_ptr<vector<DocumentRef>> ref_batch(new vector<DocumentRef>());
+				ref_batch->reserve(line_batch->size());
+			
+				for (Line const &line : *line_batch) {
+					Document doc{.id = line.n, .vocab = {}};
+					ReadDocument(line.str, doc, ngram_size);
 
-				unique_ptr<DocumentRef> ref(new DocumentRef);
-				calculate_tfidf(doc, *ref, document_cnt, df);
+					ref_batch->emplace_back();
+					calculate_tfidf(doc, ref_batch->back(), document_cnt, df, max_ngram_pruned);
+				}
 
-				score_queue.push(move(ref));
+				score_queue.push(std::move(ref_batch));
 			}
 		}));
 
 		// Function used to report the score. Implementation depends on whether
 		// we are doing print_all or not. Mutex is necessary for both cases,
 		// either for writing to top_scores or for printing to stdout.
-		function<void (float, DocumentRef const &, DocumentRef const &)> mark_score;
+		function<void (float, size_t in_ref, size_t en_ref)> mark_score;
 		mutex mark_score_mutex;
 
 		// Scores for all pairs (that meet the threshold). Only used with 
 		vector<DocumentPair> scored_pairs;
 
 		if (!print_all) {
-			mark_score = [&scored_pairs, &mark_score_mutex] (float score, DocumentRef const &in_ref, DocumentRef const &en_ref) {
+			mark_score = [&scored_pairs, &mark_score_mutex] (float score, size_t in_ref, size_t en_ref) {
 				unique_lock<mutex> lock(mark_score_mutex);
-				scored_pairs.push_back({score, in_ref.id, en_ref.id});
+				scored_pairs.push_back({score, in_ref, en_ref});
 			};
 		} else {
-			mark_score = [&mark_score_mutex](float score, DocumentRef const &in_ref, DocumentRef const &en_ref) {
+			mark_score = [&mark_score_mutex](float score, size_t in_ref, size_t en_ref) {
 				unique_lock<mutex> lock(mark_score_mutex);
-				print_score(score, in_ref.id, en_ref.id);
+				print_score(score, in_ref, en_ref);
 			};
+
+			// Print output header
+			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 		}
 
-		vector<thread> score_workers(start(n_score_threads, [&score_queue, &refs, &threshold, &mark_score]() {
+		vector<thread> score_workers(start(n_score_threads, [&score_queue, &ref_index, &threshold, &mark_score]() {
 			while (true) {
-				unique_ptr<DocumentRef> doc_ref(score_queue.pop());
+				unique_ptr<vector<DocumentRef>> doc_ref_batch(score_queue.pop());
 
-				if (!doc_ref)
+				if (!doc_ref_batch)
 					break;
 
-				for (auto const &ref : refs) {
-					float score = calculate_alignment(ref, *doc_ref);
+				for (auto &doc_ref : *doc_ref_batch) {
+					unordered_map<size_t, float> ref_scores;
+					
+					for (auto const &word_score : doc_ref.wordvec) {
+						// Search ngram hash (uint64_t) in ref_index
+						auto it = ref_index.find(word_score.hash);
+						
+						if (it == ref_index.end())
+							continue;
+						
+						for (auto const &ref_score : it->second)
+							ref_scores[ref_score.doc_id] += word_score.tfidf * ref_score.tfidf;
+					}
 
-					// Document not a match? Skip to the next.
-					if (score < threshold)
-						continue;
-
-					mark_score(score, ref, *doc_ref);
+					for (auto const &ref : ref_scores)
+						if (ref.second >= threshold)
+							mark_score(ref.second, ref.first, doc_ref.id);
 				}
 			}
 		}));
 
-		queue_lines(vm["english-tokens"].as<std::string>(), read_queue);
+		size_t read_cnt = queue_lines(vm["english-tokens"].as<std::string>(), read_queue);
+
+		UTIL_THROW_IF(read_cnt != en_document_cnt, util::Exception, "Line count changed"
+			<< " from " << en_document_cnt << " to " << read_cnt
+			<< " while reading " << vm["english-tokens"].as<std::string>() 
+			<< " in a second pass.");
 
 		// Tell all workers there is nothing left and wait for them to stop.
 		stop(read_queue, read_workers);
@@ -355,6 +444,9 @@ int main(int argc, char *argv[])
 			size_t cnt = 0;
 			size_t document_cnt = min(in_document_cnt, en_document_cnt);
 
+			// Print output header
+			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
+
 			// For each pair (with score, sorted from good to bad)
 			for (DocumentPair const &pair : scored_pairs) {
 				// If either of the documents has already been printed, skip it.
@@ -372,7 +464,7 @@ int main(int argc, char *argv[])
 
 		if (verbose)
 			cerr << "Read queue performance (Note: blocks when score queue fills up):\n" << read_queue.performance()
-			     << "Score queue performance:\n" << score_queue.performance();
+				 << "Score queue performance:\n" << score_queue.performance();
 	}
 
 	return 0;

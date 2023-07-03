@@ -1,8 +1,6 @@
 #include "document.h"
 #include "base64.h"
 #include "ngram.h"
-#include <sstream>
-#include <iostream>
 #include <cmath>
 
 using namespace std;
@@ -12,35 +10,14 @@ namespace bitextor {
 /**
  * Reads a single line of base64 encoded document into a Document.
  */
-void ReadDocument(const StringPiece &encoded, Document &document, size_t ngram_size)
+void ReadDocument(const util::StringPiece &encoded, Document &document, size_t ngram_size)
 {
 	std::string body;
 	base64_decode(encoded, body);
+
+	document.vocab.clear();
 	for (NGramIter ngram_it(body, ngram_size); ngram_it; ++ngram_it)
 		document.vocab[*ngram_it] += 1;
-}
-
-/**
- * Ostream helper for printing documents, for debugging
- */
-ostream &operator<<(ostream &stream, Document const &document)
-{
-	stream << "--- Document ---\n" << document.id << "\n";
-
-	for (auto const &entry : document.vocab)
-		stream << entry.first << ": " << entry.second << "\n";
-
-	return stream << "--- end ---";
-}
-	
-ostream &operator<<(ostream &stream, DocumentRef const &document)
-{
-	stream << "--- Document Ref ---\n" << document.id << "\n";
-
-	for (auto const &entry : document.wordvec)
-		stream << entry.hash << ": " << entry.tfidf << "\n";
-
-	return stream << "--- end ---";
 }
 	
 inline float tfidf(size_t tf, size_t dc, size_t df) {
@@ -53,75 +30,45 @@ inline float tfidf(size_t tf, size_t dc, size_t df) {
  * across all documents. Only terms that are seen in this document and in the document frequency table are
  * counted. All other terms are ignored.
 */
-void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, unordered_map<NGram, size_t> const &df) {
+void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, unordered_map<NGram, size_t> const &df, unordered_set<NGram> const &max_ngram_pruned) {
 	document_ref.id = document.id;
 
 	document_ref.wordvec.clear();
 	document_ref.wordvec.reserve(document.vocab.size());
 	
 	float total_tfidf_l2 = 0;
-	
+
 	for (auto const &entry : document.vocab) {
 		// How often does the term occur in the whole dataset?
 		auto it = df.find(entry.first);
 
-		// Match Python implementation behaviour
-		if (it == df.end())
-			continue;
-	
-		// If we can't find it (e.g. because we didn't really read the whole
-		// dataset) we just assume one: just this document.
-		size_t term_df = it == df.end() ? 1 : it->second;
-	
-		float document_tfidf = tfidf(entry.second, document_count, term_df);
+		float document_tfidf;
+
+		if (it == df.end()) {
+			if (max_ngram_pruned.find(entry.first) == max_ngram_pruned.end()) {
+				document_tfidf = tfidf(entry.second, document_count, 1);
+			}
+			else{
+				continue;
+			}
+		}
+		else {
+			document_tfidf = tfidf(entry.second, document_count, it->second);
+
+			document_ref.wordvec.push_back(WordScore{
+					.hash = entry.first,
+					.tfidf = document_tfidf
+			});
+		}
 		
 		// Keep track of the squared sum of all values for L2 normalisation
 		total_tfidf_l2 += document_tfidf * document_tfidf;
-		
-		document_ref.wordvec.push_back(WordScore{
-			.hash = entry.first,
-			.tfidf = document_tfidf
-		});
 	}
 	
-	// Sort wordvec, which is assumed by calculate_alignment
-	sort(document_ref.wordvec.begin(),
-		 document_ref.wordvec.end(),
-		 [] (WordScore const &lft, WordScore const &rgt) {
-		return lft.hash < rgt.hash;
-	});
-	
 	// Normalize
-	
 	total_tfidf_l2 = sqrt(total_tfidf_l2);
 	for (auto &entry : document_ref.wordvec)
 		entry.tfidf /= total_tfidf_l2;
-}
-
-/**
- * Dot product of two documents (of their ngram frequency really)
- */
-float calculate_alignment(DocumentRef const &left, DocumentRef const &right) {
-	float score = 0;
-	
-	auto lit = left.wordvec.cbegin(),
-		 rit = right.wordvec.cbegin(),
-		 lend = left.wordvec.cend(),
-		 rend = right.wordvec.cend();
-	
-	while (lit != lend && rit != rend) {
-		if (lit->hash < rit->hash)
-			++lit;
-		else if (rit->hash < lit->hash)
-			++rit;
-		else {
-			score += lit->tfidf * rit->tfidf;
-			++lit;
-			++rit;
-		}
-	}
-	
-	return score;
 }
 
 } // namespace bitextor

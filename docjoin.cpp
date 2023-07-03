@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <vector>
 #include <iostream>
+#include <unordered_set>
 #include <sstream>
 #include <memory>
-#include <numeric>
 #include "util/file_piece.hh"
 #include "src/base64.h"
 
@@ -37,7 +37,7 @@ ostream &operator<<(ostream &out, Row const &row) {
 typedef vector<unique_ptr<util::FilePiece>> FileSet;
 
 bool skip_rows(FileSet &files, size_t n) {
-	StringPiece line;
+	util::StringPiece line;
 
 	for (auto &file : files)
 		for (size_t i = 0; i < n; ++i)
@@ -51,7 +51,7 @@ bool read_row(FileSet &files, Row &row) {
 	row.cells.clear();
 	row.cells.reserve(files.size());
 
-	StringPiece line;
+	util::StringPiece line;
 	for (auto &file : files) {
 		if (!file->ReadLineOrEOF(line))
 			return false;
@@ -96,10 +96,7 @@ int main(int argc, char *argv[]) {
 	FileSet left_files, right_files;
 	vector<Source> order;
 	Source side = LEFT;
-
-	// Trick to easily switch between left & right files using side
 	FileSet *files[]{&left_files, &right_files};
-	
 	for (int pos = 1; pos < argc; ++pos) {
 		if (string(argv[pos]) == "-l")
 			side = LEFT;
@@ -118,22 +115,15 @@ int main(int argc, char *argv[]) {
 	// Read our joins into memory
 	vector<Join> joins;
 	string line;
-	size_t index = 0;
+	std::unordered_set<int> left_indexes;
 	while (getline(cin, line)) {
-		++index;
 		istringstream iline(line);
 		Join join;
-		if (iline >> join.left_index >> join.right_index) {
+		if (iline >> join.left_index >> join.right_index){
 			joins.push_back(join);
-		} else {
-			cerr << "Parse error at line " << index << " \"" << line << "\"\n";
-			return 1;
+			left_indexes.insert (int(join.left_index));
 		}
 	}
-
-	// Empty input? Empty output! Totally fine!
-	if (joins.empty())
-		return 0;
 
 	// Sort our joins by the right index so we can go through all right rows
 	// in a sequential order.
@@ -141,25 +131,18 @@ int main(int argc, char *argv[]) {
 		return left.right_index < right.right_index;
 	});
 
-	size_t max_left_index = accumulate(joins.begin(), joins.end(), 0, [](size_t current_max, Join const &join) {
-		return max(current_max, join.left_index);
-	});
-
 	// Read all of the left in memory
 	vector<Row> left_rows;
-	left_rows.reserve(max_left_index);
-
-	if (!left_files.empty()) {
-		while (left_rows.size() < max_left_index) {
-			Row row;
-			if (!read_row(left_files, row))
-				break;
+	size_t left_index = 0; // the indices used by docalign start at 1
+	while (true) {
+		Row row;
+		left_index++;
+		if (!read_row(left_files, row))
+			break;
+		if (left_indexes.count(left_index) >= 1)
 			left_rows.push_back(move(row));
-		}
-	} else {
-		// If there are no files to read into memory, just create empty rows
-		// to make the logic downstream simpler.
-		left_rows.resize(max_left_index);
+		else
+			left_rows.push_back(Row());
 	}
 
 	// For all joins (sorted by their right index) start reading through right
