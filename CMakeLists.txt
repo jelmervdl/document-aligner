@@ -18,6 +18,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 
 # We need boost
+set(Boost_USE_STATIC_LIBS ON)
 find_package(Boost 1.41.0 REQUIRED COMPONENTS
   program_options
   unit_test_framework
