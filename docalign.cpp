@@ -448,7 +448,7 @@ int main(int argc, char *argv[])
 			size_t document_cnt = min(in_document_cnt, en_document_cnt);
 
 			// Print output header
-			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
+			//cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 
 			// For each pair (with score, sorted from good to bad)
 			for (DocumentPair const &pair : scored_pairs) {
