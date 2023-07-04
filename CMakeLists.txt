@@ -10,6 +10,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
 set(CMAKE_CXX_FLAGS_RELEASE "-Ofast")
 set(CMAKE_CXX_FLAGS_DEBUG "-Wextra -g")
 
+# Lazy mode: get me a static binary for at least the essentials
+set(Boost_USE_STATIC_LIBS ON)
+set(ZLIB_USE_STATIC_LIBS ON)
+
 # Compile all executables into bin/
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin)
 
@@ -18,7 +22,6 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 
 # We need boost
-set(Boost_USE_STATIC_LIBS ON)
 find_package(Boost 1.41.0 REQUIRED COMPONENTS
   program_options
   unit_test_framework
