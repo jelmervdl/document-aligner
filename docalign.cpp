@@ -108,10 +108,12 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 	return queue_lines(fin, queue, skip_rate);
 }
 
-void merge(std::unordered_map<NGram,size_t> &df, std::unordered_map<NGram, size_t> const &local_df, size_t df_sample_rate) {
-	for (auto const &entry : local_df) {
+void merge(std::unordered_map<NGram,size_t> &df, std::unordered_map<NGram, size_t> &&local_df, size_t df_sample_rate) {
+	if (local_df.size() > df.size())
+		std::swap(local_df, df);
+
+	for (auto const &entry : local_df)
 		df[entry.first] += entry.second * df_sample_rate;
-	}
 }
 
 int main(int argc, char *argv[])
@@ -197,13 +199,13 @@ int main(int argc, char *argv[])
 		mutex df_mutex;
 		blocking_queue<unique_ptr<vector<Line>>> queue(n_sample_threads * QUEUE_SIZE_PER_THREAD);
 		vector<thread> workers(start(n_sample_threads, [&queue, &df, &df_mutex, &ngram_size, &df_sample_rate]() {
-			unordered_map<NGram, size_t> local_df;
-
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(queue.pop());
 
 				if (!line_batch)
 					break;
+
+				unordered_map<NGram, size_t> local_df;
 
 				for (Line const &line : *line_batch) {
 					Document document;
@@ -213,8 +215,7 @@ int main(int argc, char *argv[])
 				}
 
 				unique_lock<mutex> lock(df_mutex);
-				merge(df, local_df, df_sample_rate);
-				local_df.clear();
+				merge(df, std::move(local_df), df_sample_rate);
 			}
 		}));
 
