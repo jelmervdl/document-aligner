@@ -163,6 +163,8 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 		line_count = queue_lines(path, queue);
 		stop(queue, workers);
 
+		size_t new_ngrams = 0;
+
 		// Merge the entries that occur more than min_ngram_size times in the
 		// entire dataset.
 		for (auto &&entry : batch_df) {
@@ -171,11 +173,19 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			for (auto &&count : entry.second)
 				ngram_count += count;
 
-			if (ngram_count > min_ngram_count)
-				df[entry.first] = ngram_count;
+			if (ngram_count > min_ngram_count) {
+				auto it = df.find(entry.first);
+				if (it != df.end()) {
+					UTIL_THROW_IF2(it->second != ngram_count, "ngram count doesnt match on recount");
+				} else {
+					df[entry.first] = ngram_count;
+					++new_ngrams;
+				}
+			}
 		}
 
 		std::cerr << "Batch " << batch << ": "
+		          << new_ngrams << " new ngrams (" << (100.0f * new_ngrams / batch_df.size()) << "% of counted ngrams this batch)"
 		          << " (" << 100.0f * offset / line_count << "%)"
 		          << std::endl;
 
