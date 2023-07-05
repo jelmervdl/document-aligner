@@ -45,7 +45,7 @@ template <typename T> vector<thread> start(unsigned int n_threads, T fun) {
 	vector<thread> threads;
 	threads.reserve(n_threads);
 	for (unsigned int n = 0; n < n_threads; ++n)
-		threads.push_back(thread(fun));
+		threads.push_back(thread(fun, n));
 	return threads;
 }
 
@@ -108,13 +108,89 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 	return queue_lines(fin, queue, skip_rate);
 }
 
+constexpr size_t kCountingThreads = 16;
+
+size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path, size_t ngram_size, size_t min_ngram_count, size_t batch_size = 1 << 24)
+{
+	using SeenCount = std::array<size_t,kCountingThreads>;
+
+	util::FilePiece fin(path.c_str());
+	auto line_it = fin.begin();
+
+	size_t batch = 0;
+	size_t offset = 0;
+	size_t line_count = 0; // Will be known after first loop
+
+	do {
+		std::unordered_map<NGram,SeenCount> batch_df;
+		
+		// Read all the ngrams that occur in our batch
+		for (;line_it != fin.end() && batch_df.size() < batch_size; ++line_it, ++offset) {
+			Document document;
+			ReadDocument(*line_it, document, ngram_size);
+			for (auto const &entry : document.vocab) {
+				// Skip ngrams we've already counted for now
+				if (df.find(entry.first) != df.end())
+					continue;
+
+				batch_df.emplace(std::make_pair(entry.first, SeenCount{0}));
+			}
+		}
+
+		std::cerr << "Batch " << batch << ": read " << offset << " documents " << batch_df.size() << " ngrams" << std::endl;
+
+		// Read all of the data to count how often these ngrams occur in it
+		blocking_queue<unique_ptr<vector<Line>>> queue(kCountingThreads * QUEUE_SIZE_PER_THREAD);
+		std::vector<thread> workers(start(kCountingThreads, [&queue, &batch_df, ngram_size](size_t thread_id) {
+			while (true) {
+				unique_ptr<vector<Line>> line_batch(queue.pop());
+
+				if (!line_batch)
+					break;
+
+				for (Line const &line : *line_batch) {
+					Document document;
+					ReadDocument(line.str, document, ngram_size);
+					for (auto const &entry : document.vocab) {
+						auto it = batch_df.find(entry.first);
+						if (it != batch_df.end())
+							it->second[thread_id] += 1;
+					}
+				}
+			}
+		}));
+
+		line_count = queue_lines(path, queue);
+		stop(queue, workers);
+
+		// Merge the entries that occur more than min_ngram_size times in the
+		// entire dataset.
+		for (auto &&entry : batch_df) {
+			size_t ngram_count = 0;
+
+			for (auto &&count : entry.second)
+				ngram_count += count;
+
+			if (ngram_count > min_ngram_count)
+				df[entry.first] = ngram_count;
+		}
+
+		std::cerr << "Batch " << batch << ": "
+		          << " (" << 100.0f * offset / line_count << "%)"
+		          << std::endl;
+
+	} while (line_it != fin.end());
+
+	return offset;
+}
+
 int main(int argc, char *argv[])
 {
 	unsigned int n_threads = thread::hardware_concurrency();
 	
 	float threshold = 0.1;
 	
-	size_t df_sample_rate = 1;
+	size_t batch_size = 20000000;
 	
 	size_t ngram_size = 2;
 
@@ -133,8 +209,8 @@ int main(int argc, char *argv[])
 	po::options_description generic_desc("Additional options");
 	generic_desc.add_options()
 		("help", "produce help message")
-		("df-sample-rate", po::value<size_t>(&df_sample_rate), "set sample rate to every n-th document (default: 1)")
 		("ngram_size,n", po::value<size_t>(&ngram_size), "ngram size (default: 2)")
+		("batch_size,b", po::value<size_t>(&batch_size), "batch size (default: 20_000_000)")
 		("jobs,j", po::value<unsigned int>(&n_threads), "set number of threads (default: all)")
 		("threshold", po::value<float>(&threshold), "set score threshold (default: 0.1)")
 		("min_count", po::value<size_t>(&min_ngram_cnt), "minimal number of documents an ngram can appear in to be included in DF (default: 2)")
@@ -167,8 +243,6 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	unsigned int n_sample_threads = n_threads;
-
 	unsigned int n_load_threads = n_threads;
 
 	// Note: I've tried many heuristics for the number of reading threads, but
@@ -187,77 +261,35 @@ int main(int argc, char *argv[])
 	unordered_set<NGram> max_ngram_pruned;
 	size_t in_document_cnt, en_document_cnt, document_cnt;
 
-	{
-		mutex df_mutex;
-		blocking_queue<unique_ptr<vector<Line>>> queue(n_sample_threads * QUEUE_SIZE_PER_THREAD);
-		vector<thread> workers(start(n_sample_threads, [&queue, &df, &df_mutex, &ngram_size, &df_sample_rate]() {
-			unordered_map<NGram, size_t> local_df;
-
-			while (true) {
-				unique_ptr<vector<Line>> line_batch(queue.pop());
-
-				if (!line_batch)
-					break;
-
-				for (Line const &line : *line_batch) {
-					Document document;
-					ReadDocument(line.str, document, ngram_size);
-					for (auto const &entry : document.vocab)
-						local_df[entry.first] += 1; // Count once every document
-				}
-			}
-
-			// Merge the local DF into the global one. Multiply by df_sample_rate
-			// to compensate for reading only nth part of the whole collection.
-			{
-				unique_lock<mutex> lock(df_mutex);
-				for (auto const &entry : local_df)
-					df[entry.first] += entry.second * df_sample_rate;
-			}
-		}));
-
-		// We'll use in_document_cnt later to reserve some space for the documents
-		// we want to keep in memory. (Also this line is the whole reason the
-		// worker management + reading isn't wrapped in a single function: I
-		// want to re-use the same workers for two files.)
-		en_document_cnt = queue_lines(vm["english-tokens"].as<std::string>(), queue, df_sample_rate);
-		in_document_cnt = queue_lines(vm["translated-tokens"].as<std::string>(), queue, df_sample_rate);
-		document_cnt = in_document_cnt + en_document_cnt;
-
-		stop(queue, workers);
-
-		if (verbose)
-			cerr << "Calculated DF from " << document_cnt / df_sample_rate << " documents" << endl;
-
-		if (verbose)
-			cerr << "DF queue performance:\n" << queue.performance();
-	}
+	// We'll use in_document_cnt later to reserve some space for the documents
+	// we want to keep in memory.
+	en_document_cnt = compute_df(df, vm["english-tokens"].as<std::string>(), ngram_size, min_ngram_cnt, batch_size);
+	in_document_cnt = compute_df(df, vm["translated-tokens"].as<std::string>(), ngram_size, min_ngram_cnt, batch_size);
+	document_cnt = in_document_cnt + en_document_cnt;
 
 	// Prune the DF table, similar to what the Python implementation does. Note
 	// that these counts are linked to sample-rate already, so if you have a
 	// sample rate of higher than 1, your min_ngram_count should also be a
 	// multiple of sample rate + 1.
-	{
-		unordered_map<NGram, size_t> pruned_df;
-		for (auto const &entry : df) {
-			if (entry.second < min_ngram_cnt)
-				continue;
+	size_t old_size = df.size();
 
-			if (entry.second > max_ngram_cnt) {
-				max_ngram_pruned.insert(entry.first);
-				continue;
-			}
-
-			pruned_df[entry.first] = entry.second;
+	for (auto it = df.begin(); it != df.end();) {
+		if (it->second < min_ngram_cnt) {
+			it = df.erase(it);
 		}
+		else if (it->second > max_ngram_cnt) {
+			max_ngram_pruned.insert(it->first);
+			it = df.erase(it);
+		} else {
+			// Keep it.
+			++it;
+		}
+	}
 
-		if (verbose) {
-            cerr << "Pruned " << df.size() - pruned_df.size() << " (" << 100.0 - 100.0 * pruned_df.size() / df.size()
-                 << "%) entries from DF" << endl;
-            cerr << "Very frequent ngram set is now " << max_ngram_pruned.size() << " long." << endl;
-        }
-
-		swap(df, pruned_df);
+	if (verbose) {
+		cerr << "Pruned " << old_size - df.size() << " (" << 100.0 - 100.0 * df.size() / old_size << "%) entries from DF\n"
+		     << "Very frequent ngram set is now " << max_ngram_pruned.size() << " long."
+		     << endl;
 	}
 
 	// Read translated documents & pre-calculate TF/DF for each of these documents
@@ -267,7 +299,7 @@ int main(int argc, char *argv[])
 		mutex ref_index_mutex;
 
 		blocking_queue<unique_ptr<vector<Line>>> queue(n_load_threads * QUEUE_SIZE_PER_THREAD);
-		vector<thread> workers(start(n_load_threads, [&queue, &ref_index, &ref_index_mutex, &df, &max_ngram_pruned, &document_cnt, &ngram_size]() {
+		vector<thread> workers(start(n_load_threads, [&queue, &ref_index, &ref_index_mutex, &df, &max_ngram_pruned, &document_cnt, &ngram_size](size_t) {
 			unordered_map<NGram, vector<DocumentNGramScore>> local_ref_index;
 
 			while (true) {
@@ -335,7 +367,7 @@ int main(int argc, char *argv[])
 
 		blocking_queue<unique_ptr<vector<DocumentRef>>> score_queue(n_score_threads * QUEUE_SIZE_PER_THREAD);
 
-		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &max_ngram_pruned, &ngram_size]() {
+		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &max_ngram_pruned, &ngram_size](size_t) {
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(read_queue.pop());
 
@@ -382,7 +414,7 @@ int main(int argc, char *argv[])
 			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 		}
 
-		vector<thread> score_workers(start(n_score_threads, [&score_queue, &ref_index, &threshold, &mark_score]() {
+		vector<thread> score_workers(start(n_score_threads, [&score_queue, &ref_index, &threshold, &mark_score](size_t) {
 			while (true) {
 				unique_ptr<vector<DocumentRef>> doc_ref_batch(score_queue.pop());
 
