@@ -200,7 +200,7 @@ int main(int argc, char *argv[])
 	
 	float threshold = 0.1;
 	
-	size_t batch_size = 20000000;
+	size_t batch_size = 50000000;
 	
 	size_t ngram_size = 2;
 
@@ -220,7 +220,7 @@ int main(int argc, char *argv[])
 	generic_desc.add_options()
 		("help", "produce help message")
 		("ngram_size,n", po::value<size_t>(&ngram_size), "ngram size (default: 2)")
-		("batch_size,b", po::value<size_t>(&batch_size), "batch size (default: 20_000_000)")
+		("batch_size,b", po::value<size_t>(&batch_size), "batch size (default: 50_000_000)")
 		("jobs,j", po::value<unsigned int>(&n_threads), "set number of threads (default: all)")
 		("threshold", po::value<float>(&threshold), "set score threshold (default: 0.1)")
 		("min_count", po::value<size_t>(&min_ngram_cnt), "minimal number of documents an ngram can appear in to be included in DF (default: 2)")
