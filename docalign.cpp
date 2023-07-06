@@ -108,6 +108,14 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 	return queue_lines(fin, queue, skip_rate);
 }
 
+void merge(std::unordered_map<NGram,size_t> &df, std::unordered_map<NGram, size_t> &&local_df, size_t df_sample_rate) {
+	if (local_df.size() > df.size())
+		std::swap(local_df, df);
+
+	for (auto const &entry : local_df)
+		df[entry.first] += entry.second * df_sample_rate;
+}
+
 int main(int argc, char *argv[])
 {
 	unsigned int n_threads = thread::hardware_concurrency();
@@ -191,13 +199,13 @@ int main(int argc, char *argv[])
 		mutex df_mutex;
 		blocking_queue<unique_ptr<vector<Line>>> queue(n_sample_threads * QUEUE_SIZE_PER_THREAD);
 		vector<thread> workers(start(n_sample_threads, [&queue, &df, &df_mutex, &ngram_size, &df_sample_rate]() {
-			unordered_map<NGram, size_t> local_df;
-
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(queue.pop());
 
 				if (!line_batch)
 					break;
+
+				unordered_map<NGram, size_t> local_df;
 
 				for (Line const &line : *line_batch) {
 					Document document;
@@ -205,14 +213,9 @@ int main(int argc, char *argv[])
 					for (auto const &entry : document.vocab)
 						local_df[entry.first] += 1; // Count once every document
 				}
-			}
 
-			// Merge the local DF into the global one. Multiply by df_sample_rate
-			// to compensate for reading only nth part of the whole collection.
-			{
 				unique_lock<mutex> lock(df_mutex);
-				for (auto const &entry : local_df)
-					df[entry.first] += entry.second * df_sample_rate;
+				merge(df, std::move(local_df), df_sample_rate);
 			}
 		}));
 
@@ -445,7 +448,7 @@ int main(int argc, char *argv[])
 			size_t document_cnt = min(in_document_cnt, en_document_cnt);
 
 			// Print output header
-			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
+			//cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 
 			// For each pair (with score, sorted from good to bad)
 			for (DocumentPair const &pair : scored_pairs) {
