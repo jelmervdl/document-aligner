@@ -15,9 +15,14 @@ void ReadDocument(const util::StringPiece &encoded, Document &document, size_t n
 	std::string body;
 	base64_decode(encoded, body);
 
-	document.vocab.clear();
-	for (NGramIter ngram_it(body, ngram_size); ngram_it; ++ngram_it)
-		document.vocab[*ngram_it] += 1;
+	document.vocab.Clear();
+	for (NGramIter ngram_it(body, ngram_size); ngram_it; ++ngram_it) {
+		NGramFrequencyMap::MutableIterator it;
+		NGramFrequencyEntry entry{*ngram_it, 1};
+		if (document.vocab.FindOrInsert(entry, it)) {
+			it->count += 1;
+		}
+	}
 }
 	
 inline float tfidf(size_t tf, size_t dc, size_t df) {
@@ -30,40 +35,37 @@ inline float tfidf(size_t tf, size_t dc, size_t df) {
  * across all documents. Only terms that are seen in this document and in the document frequency table are
  * counted. All other terms are ignored.
 */
-void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, unordered_map<NGram, size_t> const &df, unordered_set<NGram> const &max_ngram_pruned) {
+void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, NGramFrequencyMap const &df) {
 	document_ref.id = document.id;
 
 	document_ref.wordvec.clear();
-	document_ref.wordvec.reserve(document.vocab.size());
+	document_ref.wordvec.reserve(document.vocab.Size());
 	
 	float total_tfidf_l2 = 0;
 
-	for (auto const &entry : document.vocab) {
-		// How often does the term occur in the whole dataset?
-		auto it = df.find(entry.first);
-
+	document.vocab.ForEach([&](NGramFrequencyEntry const &entry) {
 		float document_tfidf;
 
-		if (it == df.end()) {
-			if (max_ngram_pruned.find(entry.first) == max_ngram_pruned.end()) {
-				document_tfidf = tfidf(entry.second, document_count, 1);
-			}
-			else{
-				continue;
-			}
-		}
-		else {
-			document_tfidf = tfidf(entry.second, document_count, it->second);
+		// How often does the term occur in the whole dataset?
+		NGramFrequencyMap::ConstIterator df_it;
+		if (df.Find(entry.ngram, df_it)) {
+			// Pruned because it appeared too often, so we ignore it entirely
+			if (!df_it->count)
+				return;
+
+			document_tfidf = tfidf(entry.count, document_count, df_it->count);
 
 			document_ref.wordvec.push_back(WordScore{
-					.hash = entry.first,
+					.hash = entry.ngram,
 					.tfidf = document_tfidf
 			});
+		} else {
+			document_tfidf = tfidf(entry.count, document_count, 1);
 		}
-		
+
 		// Keep track of the squared sum of all values for L2 normalisation
 		total_tfidf_l2 += document_tfidf * document_tfidf;
-	}
+	});
 	
 	// Normalize
 	total_tfidf_l2 = sqrt(total_tfidf_l2);

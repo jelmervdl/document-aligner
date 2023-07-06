@@ -18,7 +18,7 @@ struct Document {
 	size_t id;
 	
 	// ngram frequency in document
-	std::unordered_map<NGram, size_t> vocab;
+	NGramFrequencyMap vocab;
 };
 
 struct DocumentRef {
@@ -32,6 +32,6 @@ struct DocumentRef {
 // Assumes base64 encoded still.
 void ReadDocument(const util::StringPiece &encoded, Document &to, size_t ngram_size);
 
-void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, std::unordered_map<NGram, size_t> const &df, std::unordered_set<NGram> const &max_ngram_pruned);
+void calculate_tfidf(Document const &document, DocumentRef &document_ref, size_t document_count, NGramFrequencyMap const &df);
 
 } // namespace bitextor

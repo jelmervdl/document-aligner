@@ -2,6 +2,7 @@
 #include <vector>
 #include <boost/iterator/iterator_facade.hpp>
 #include <util/tokenize_piece.hh>
+#include <util/probing_hash_table.hh>
 
 namespace bitextor {
 
@@ -59,3 +60,26 @@ namespace std {
 		}
 	};
 } // namespace std
+
+namespace bitextor {
+
+struct NGramEntry {
+	NGram ngram;
+	using Key = NGram;
+	NGram GetKey() const { return ngram; }
+	void SetKey(NGram key) { ngram = key; }
+};
+
+struct NGramFrequencyEntry {
+	NGram ngram;
+	size_t count;
+	using Key = NGram;
+	NGram GetKey() const { return ngram; }
+	void SetKey(NGram key) { ngram = key; }
+};
+
+using NGramSet = util::AutoProbing<NGramEntry, std::hash<NGram>>;
+
+using NGramFrequencyMap = util::AutoProbing<NGramFrequencyEntry, std::hash<NGram>>;
+
+}

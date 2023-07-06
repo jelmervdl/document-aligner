@@ -110,10 +110,8 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 
 constexpr size_t kCountingThreads = 16;
 
-size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path, size_t ngram_size, size_t min_ngram_count, size_t batch_size = 1 << 24)
+size_t compute_df(NGramFrequencyMap &df, std::string const &path, size_t ngram_size, size_t min_ngram_count, size_t batch_size = 1 << 24)
 {
-	using SeenCount = std::array<size_t,kCountingThreads>;
-
 	util::FilePiece fin(path.c_str());
 	auto line_it = fin.begin();
 
@@ -121,27 +119,45 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 	size_t offset = 0;
 	size_t line_count = 0; // Will be known after first loop
 
+	Document doc;
+
 	do {
-		std::unordered_map<NGram,SeenCount> batch_df;
+		struct NGramPartialCountEntry {
+			NGram ngram;
+			std::array<uint32_t,kCountingThreads> count;
+			using Key = NGram;
+			Key GetKey() const { return ngram; }
+			void SetKey(Key key) { ngram = key; }
+		};
+
+		using NGramPartialCountMap = util::AutoProbing<NGramPartialCountEntry, std::hash<NGram>>;
+		NGramPartialCountMap batch_df;
 		
 		// Read all the ngrams that occur in our batch
-		for (;line_it != fin.end() && batch_df.size() < batch_size; ++line_it, ++offset) {
-			Document document;
-			ReadDocument(*line_it, document, ngram_size);
-			for (auto const &entry : document.vocab) {
-				// Skip ngrams we've already counted for now
-				if (df.find(entry.first) != df.end())
-					continue;
+		for (;line_it != fin.end() && batch_df.Size() < batch_size; ++line_it, ++offset) {
+			ReadDocument(*line_it, doc, ngram_size);
 
-				batch_df.emplace(std::make_pair(entry.first, SeenCount{0}));
-			}
+			// TODO: Do we still need this very defensive reservation?
+			// batch_df.Reserve(batch_df.Size() + doc.vocab.Size());
+			batch_df.Reserve(doc.vocab.Size());
+			
+			doc.vocab.ForEach([&](NGramFrequencyEntry const &entry) {
+				// Skip ngrams we've already counted for now
+				if (df.Contains(entry.ngram))
+					return;
+
+				NGramPartialCountEntry ngram_count{entry.ngram,{0}};
+				NGramPartialCountMap::MutableIterator it;
+				batch_df.FindOrInsert(ngram_count, it);
+			});
 		}
 
-		std::cerr << "Batch " << batch << ": read " << offset << " documents " << batch_df.size() << " ngrams" << std::endl;
+		std::cerr << "Batch " << batch << ": read " << offset << " documents " << batch_df.Size() << " ngrams" << std::endl;
 
 		// Read all of the data to count how often these ngrams occur in it
 		blocking_queue<unique_ptr<vector<Line>>> queue(kCountingThreads * QUEUE_SIZE_PER_THREAD);
 		std::vector<thread> workers(start(kCountingThreads, [&queue, &batch_df, ngram_size](size_t thread_id) {
+			Document doc;
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(queue.pop());
 
@@ -149,13 +165,13 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 					break;
 
 				for (Line const &line : *line_batch) {
-					Document document;
-					ReadDocument(line.str, document, ngram_size);
-					for (auto const &entry : document.vocab) {
-						auto it = batch_df.find(entry.first);
-						if (it != batch_df.end())
-							it->second[thread_id] += 1;
-					}
+					ReadDocument(line.str, doc, ngram_size);
+					doc.vocab.ForEach([&](NGramFrequencyEntry const &entry) {
+						NGramPartialCountMap::MutableIterator it;
+						if (batch_df.UnsafeMutableFind(entry.ngram, it)) {
+							it->count[thread_id] += 1;
+						}
+					});
 				}
 			}
 		}));
@@ -167,25 +183,22 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 
 		// Merge the entries that occur more than min_ngram_size times in the
 		// entire dataset.
-		for (auto &&entry : batch_df) {
+		batch_df.ForEach([&](NGramPartialCountEntry const &entry) {
 			size_t ngram_count = 0;
 
-			for (auto &&count : entry.second)
+			for (auto &&count : entry.count)
 				ngram_count += count;
 
 			if (ngram_count > min_ngram_count) {
-				auto it = df.find(entry.first);
-				if (it != df.end()) {
-					UTIL_THROW_IF2(it->second != ngram_count, "ngram count doesnt match on recount");
-				} else {
-					df[entry.first] = ngram_count;
+				NGramFrequencyMap::MutableIterator it;
+				if (!df.FindOrInsert(NGramFrequencyEntry{entry.ngram, ngram_count}, it)) {
 					++new_ngrams;
 				}
 			}
-		}
+		});
 
 		std::cerr << "Batch " << batch << ": "
-		          << new_ngrams << " new ngrams (" << (100.0f * new_ngrams / batch_df.size()) << "% of counted ngrams this batch)"
+		          << new_ngrams << " new ngrams (" << (100.0f * new_ngrams / batch_df.Size()) << "% of counted ngrams this batch)"
 		          << " (" << 100.0f * offset / line_count << "%)"
 		          << std::endl;
 
@@ -200,7 +213,7 @@ int main(int argc, char *argv[])
 	
 	float threshold = 0.1;
 	
-	size_t batch_size = 50000000;
+	size_t batch_size = 10000000;
 	
 	size_t ngram_size = 2;
 
@@ -267,8 +280,7 @@ int main(int argc, char *argv[])
 	// Calculate the document frequency for terms. Starts a couple of threads
 	// that parse documents and keep a local hash table for counting. At the
 	// end these tables are merged into df.
-	unordered_map<NGram,size_t> df;
-	unordered_set<NGram> max_ngram_pruned;
+	NGramFrequencyMap df;
 	size_t in_document_cnt, en_document_cnt, document_cnt;
 
 	// We'll use in_document_cnt later to reserve some space for the documents
@@ -281,25 +293,20 @@ int main(int argc, char *argv[])
 	// that these counts are linked to sample-rate already, so if you have a
 	// sample rate of higher than 1, your min_ngram_count should also be a
 	// multiple of sample rate + 1.
-	size_t old_size = df.size();
+	size_t old_size = df.Size();
+	size_t new_size = 0;
 
-	for (auto it = df.begin(); it != df.end();) {
-		if (it->second < min_ngram_cnt) {
-			it = df.erase(it);
-		}
-		else if (it->second > max_ngram_cnt) {
-			max_ngram_pruned.insert(it->first);
-			it = df.erase(it);
-		} else {
-			// Keep it.
-			++it;
-		}
-	}
+	df.MutableForEach([&](NGramFrequencyEntry &entry) {
+		UTIL_THROW_IF2(entry.count < min_ngram_cnt, "df entry under min_ngram_cnt ended up in df");
+
+		if (entry.count > max_ngram_cnt)
+			entry.count = 0; // 0 means pruned
+		else
+			++new_size;
+	});
 
 	if (verbose) {
-		cerr << "Pruned " << old_size - df.size() << " (" << 100.0 - 100.0 * df.size() / old_size << "%) entries from DF\n"
-		     << "Very frequent ngram set is now " << max_ngram_pruned.size() << " long."
-		     << endl;
+		cerr << "Pruned " << old_size - new_size << " (" << 100.0 - 100.0 * new_size / old_size << "%) entries from DF" << endl;
 	}
 
 	// Read translated documents & pre-calculate TF/DF for each of these documents
@@ -309,7 +316,7 @@ int main(int argc, char *argv[])
 		mutex ref_index_mutex;
 
 		blocking_queue<unique_ptr<vector<Line>>> queue(n_load_threads * QUEUE_SIZE_PER_THREAD);
-		vector<thread> workers(start(n_load_threads, [&queue, &ref_index, &ref_index_mutex, &df, &max_ngram_pruned, &document_cnt, &ngram_size](size_t) {
+		vector<thread> workers(start(n_load_threads, [&queue, &ref_index, &ref_index_mutex, &df, &document_cnt, &ngram_size](size_t) {
 			unordered_map<NGram, vector<DocumentNGramScore>> local_ref_index;
 
 			while (true) {
@@ -327,7 +334,7 @@ int main(int argc, char *argv[])
 					// so there should be no concurrency issue.
 					// DF is accessed read-only. N starts counting at 1.
 					DocumentRef ref;
-					calculate_tfidf(doc, ref, document_cnt, df, max_ngram_pruned);
+					calculate_tfidf(doc, ref, document_cnt, df);
 
 					for (auto const &entry : ref.wordvec) {
 						local_ref_index[entry.hash].push_back(DocumentNGramScore{
@@ -377,7 +384,7 @@ int main(int argc, char *argv[])
 
 		blocking_queue<unique_ptr<vector<DocumentRef>>> score_queue(n_score_threads * QUEUE_SIZE_PER_THREAD);
 
-		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &max_ngram_pruned, &ngram_size](size_t) {
+		vector<thread> read_workers(start(n_read_threads, [&read_queue, &score_queue, &document_cnt, &df, &ngram_size](size_t) {
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(read_queue.pop());
 
@@ -393,7 +400,7 @@ int main(int argc, char *argv[])
 					ReadDocument(line.str, doc, ngram_size);
 
 					ref_batch->emplace_back();
-					calculate_tfidf(doc, ref_batch->back(), document_cnt, df, max_ngram_pruned);
+					calculate_tfidf(doc, ref_batch->back(), document_cnt, df);
 				}
 
 				score_queue.push(std::move(ref_batch));
