@@ -75,22 +75,27 @@ void print_score(float score, size_t left_id, size_t right_id)
 		 << '\n';
 }
 
-size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
+size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t offset = 0)
 {
 	size_t document_count = 0;
 
 	auto it = fin.begin();
+
+	// Skip ahead to offset
+	while (document_count < offset && it != fin.end()) {
+		++document_count;
+		++it;
+	}
 
 	while (it != fin.end()) {
 		unique_ptr<vector<Line>> line_batch(new vector<Line>());
 		line_batch->reserve(BATCH_SIZE);
 
 		for (size_t i = 0; i < BATCH_SIZE; ++i) {
-			if (document_count++ % skip_rate == 0)
-				line_batch->push_back({
-					.str = string(it->data(), it->size()),
-					.n = document_count
-				});
+			line_batch->push_back({
+				.str = string(it->data(), it->size()),
+				.n = ++document_count
+			});
 
 			if (++it == fin.end())
 				break;
@@ -129,11 +134,11 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			Document document;
 			ReadDocument(*line_it, document, ngram_size);
 			for (auto const &entry : document.vocab) {
-				// Skip ngrams we've already counted for now
+				// Skip ngrams we've already counted
 				if (df.find(entry.first) != df.end())
 					continue;
 
-				batch_df.emplace(std::make_pair(entry.first, SeenCount{0}));
+				batch_df[entry.first][0] += 1;
 			}
 		}
 
@@ -160,7 +165,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			}
 		}));
 
-		line_count = queue_lines(path, queue);
+		line_count = queue_lines(path, queue, offset);
 		stop(queue, workers);
 
 		size_t new_ngrams = 0;
