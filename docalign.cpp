@@ -75,29 +75,23 @@ void print_score(float score, size_t left_id, size_t right_id)
 		 << '\n';
 }
 
-size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t offset = 0)
+size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
 {
 	size_t document_count = 0;
 
-	auto it = fin.begin();
-
-	// Skip ahead to offset
-	while (document_count < offset && it != fin.end()) {
-		++document_count;
-		++it;
-	}
-
-	while (it != fin.end()) {
+	while (it != end) {
 		unique_ptr<vector<Line>> line_batch(new vector<Line>());
 		line_batch->reserve(BATCH_SIZE);
 
 		for (size_t i = 0; i < BATCH_SIZE; ++i) {
-			line_batch->push_back({
-				.str = string(it->data(), it->size()),
-				.n = ++document_count
-			});
+			if (document_count++ % skip_rate == 0) {
+				line_batch->push_back({
+					.str = string(it->data(), it->size()),
+					.n = document_count
+				});
+			}
 
-			if (++it == fin.end())
+			if (++it == end)
 				break;
 		}
 
@@ -110,7 +104,7 @@ size_t queue_lines(util::FilePiece &fin, blocking_queue<unique_ptr<vector<Line>>
 size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
 {
 	util::FilePiece fin(path.c_str());
-	return queue_lines(fin, queue, skip_rate);
+	return queue_lines(fin.begin(), fin.end(), queue, skip_rate);
 }
 
 constexpr size_t kCountingThreads = 16;
@@ -119,14 +113,21 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 {
 	using SeenCount = std::array<size_t,kCountingThreads>;
 
-	util::FilePiece fin(path.c_str());
-	auto line_it = fin.begin();
-
 	size_t batch = 0;
 	size_t offset = 0;
 	size_t line_count = 0; // Will be known after first loop
 
 	do {
+		// Re-open file again
+		// TODO: Ideally we could seek backwards or mark a restore point to resume
+		// decompressing from `offset`. That would be cool.
+		util::FilePiece fin(path.c_str());
+		auto line_it = fin.begin();
+
+		// Advance till offset again
+		for (size_t i = 0; i < offset; ++i)
+			++line_it;
+
 		std::unordered_map<NGram,SeenCount> batch_df;
 		
 		// Read all the ngrams that occur in our batch
@@ -146,7 +147,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 
 		// Read all of the data to count how often these ngrams occur in it
 		blocking_queue<unique_ptr<vector<Line>>> queue(kCountingThreads * QUEUE_SIZE_PER_THREAD);
-		std::vector<thread> workers(start(kCountingThreads, [&queue, &batch_df, ngram_size](size_t thread_id) {
+		std::vector<thread> workers(start(kCountingThreads, [&](size_t thread_id) {
 			while (true) {
 				unique_ptr<vector<Line>> line_batch(queue.pop());
 
@@ -165,7 +166,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			}
 		}));
 
-		line_count = queue_lines(path, queue, offset);
+		line_count = offset + queue_lines(line_it, fin.end(), queue);
 		stop(queue, workers);
 
 		size_t new_ngrams = 0;
@@ -193,8 +194,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 		          << new_ngrams << " new ngrams (" << (100.0f * new_ngrams / batch_df.size()) << "% of counted ngrams this batch)"
 		          << " (" << 100.0f * offset / line_count << "%)"
 		          << std::endl;
-
-	} while (line_it != fin.end());
+	} while (offset < line_count);
 
 	return offset;
 }
