@@ -129,6 +129,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			++line_it;
 
 		std::unordered_map<NGram,SeenCount> batch_df;
+		size_t old_offset = offset;
 		
 		// Read all the ngrams that occur in our batch
 		for (;line_it != fin.end() && batch_df.size() < batch_size; ++line_it, ++offset) {
@@ -143,7 +144,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			}
 		}
 
-		std::cerr << "Batch " << batch << ": read " << offset << " documents " << batch_df.size() << " ngrams" << std::endl;
+		std::cerr << "Batch " << batch << ": read " << (offset - old_offset) << " documents with " << batch_df.size() << " unique ngrams" << std::endl;
 
 		// Read all of the data to count how often these ngrams occur in it
 		blocking_queue<unique_ptr<vector<Line>>> queue(kCountingThreads * QUEUE_SIZE_PER_THREAD);
@@ -176,24 +177,22 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 		for (auto &&entry : batch_df) {
 			size_t ngram_count = 0;
 
+			// Sum counts of
 			for (auto &&count : entry.second)
 				ngram_count += count;
 
 			if (ngram_count > min_ngram_count) {
-				auto it = df.find(entry.first);
-				if (it != df.end()) {
-					UTIL_THROW_IF2(it->second != ngram_count, "ngram count doesnt match on recount");
-				} else {
-					df[entry.first] = ngram_count;
-					++new_ngrams;
-				}
+				df[entry.first] = ngram_count;
+				++new_ngrams;
 			}
 		}
 
 		std::cerr << "Batch " << batch << ": "
-		          << new_ngrams << " new ngrams (" << (100.0f * new_ngrams / batch_df.size()) << "% of counted ngrams this batch)"
-		          << " (" << 100.0f * offset / line_count << "%)"
+		          << new_ngrams << " new ngrams added to df (" << (100.0f * new_ngrams / batch_df.size()) << "% of counted ngrams this batch)"
+		          << " (read " << offset << " / " << line_count << " documents: "
+		          << 100.0f * offset / line_count << "%)"
 		          << std::endl;
+		++batch;
 	} while (offset < line_count);
 
 	return offset;
