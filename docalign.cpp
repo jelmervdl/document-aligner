@@ -109,10 +109,8 @@ size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Lin
 
 constexpr size_t kCountingThreads = 16;
 
-size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path, size_t ngram_size, size_t min_ngram_count, size_t batch_size = 1 << 24)
+size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path, size_t ngram_size, size_t min_ngram_count, uint32_t batch_size = 1 << 24)
 {
-	using SeenCount = std::array<size_t,kCountingThreads>;
-
 	size_t batch = 0;
 	size_t offset = 0;
 	size_t line_count = 0; // Will be known after first loop
@@ -128,8 +126,13 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 		for (size_t i = 0; i < offset; ++i)
 			++line_it;
 
-		std::unordered_map<NGram,SeenCount> batch_df;
 		size_t old_offset = offset;
+		
+		// ngrams we look at this batch, storing an index into the counter arrays
+		std::unordered_map<NGram,uint32_t> batch_df;
+		
+		// Per thread, we count the number of documents we see a certain entry in
+		std::array<std::vector<uint32_t>,kCountingThreads> counters{};
 		
 		// Read all the ngrams that occur in our batch
 		for (;line_it != fin.end() && batch_df.size() < batch_size; ++line_it, ++offset) {
@@ -140,13 +143,26 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 				if (df.find(entry.first) != df.end())
 					continue;
 
-				batch_df[entry.first][0] += 1;
+				auto it = batch_df.find(entry.first);
+				if (it == batch_df.end()) {
+					batch_df[entry.first] = counters[0].size();
+					counters[0].push_back(1);
+				} else {
+					counters[0][it->second] += 1;
+				}
 			}
 		}
 
 		std::cerr << "Batch " << batch << ": read " << (offset - old_offset) << " documents with " << batch_df.size() << " unique ngrams" << std::endl;
 
 		// Read all of the data to count how often these ngrams occur in it
+
+		// Allocate the rest of the counters for all of the counting threads
+		// (thread 0 just continues counting in the first one)
+		UTIL_THROW_IF2(counters[0].size() != batch_df.size(), "batch_df is not the same size as the counter array");
+		for (size_t i = 1; i < kCountingThreads; ++i)
+			counters[i].resize(counters[0].size(), 0);
+
 		blocking_queue<unique_ptr<vector<Line>>> queue(kCountingThreads * QUEUE_SIZE_PER_THREAD);
 		std::vector<thread> workers(start(kCountingThreads, [&](size_t thread_id) {
 			while (true) {
@@ -161,7 +177,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 					for (auto const &entry : document.vocab) {
 						auto it = batch_df.find(entry.first);
 						if (it != batch_df.end())
-							it->second[thread_id] += 1;
+							counters[thread_id][it->second] += 1;
 					}
 				}
 			}
@@ -174,15 +190,15 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 
 		// Merge the entries that occur more than min_ngram_size times in the
 		// entire dataset.
-		for (auto &&entry : batch_df) {
+		for (auto it = batch_df.begin(); it != batch_df.end(); ++it) {
 			size_t ngram_count = 0;
 
-			// Sum counts of
-			for (auto &&count : entry.second)
-				ngram_count += count;
+			// Sum counts of all the counting threads
+			for (size_t i = 0; i < kCountingThreads; ++i)
+				ngram_count += counters[i][it->second];
 
 			if (ngram_count > min_ngram_count) {
-				df[entry.first] = ngram_count;
+				df[it->first] = ngram_count;
 				++new_ngrams;
 			}
 		}
