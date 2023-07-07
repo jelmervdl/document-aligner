@@ -197,7 +197,7 @@ size_t compute_df(std::unordered_map<NGram,size_t> &df, std::string const &path,
 			for (size_t i = 0; i < kCountingThreads; ++i)
 				ngram_count += counters[i][it->second];
 
-			if (ngram_count > min_ngram_count) {
+			if (ngram_count >= min_ngram_count) {
 				df[it->first] = ngram_count;
 				++new_ngrams;
 			}
