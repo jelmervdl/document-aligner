@@ -33,4 +33,4 @@ jobs:
         run: make test
       - name: run end-to-end tests
         working-directory: tests/docalign
-        run: PATH=../../build:$PATH ./run.sh
+        run: PATH=../../build/bin:$PATH ./run.sh
