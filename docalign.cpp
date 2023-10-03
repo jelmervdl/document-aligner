@@ -69,10 +69,10 @@ ostream &operator<<(ostream &out, queue_performance const &performance) {
 void print_score(float score, size_t left_id, size_t right_id)
 {
 	cout << fixed << setprecision(5)
-		 << score
-		 << '\t' << left_id
-		 << '\t' << right_id
-		 << '\n';
+	     << score
+	     << '\t' << left_id
+	     << '\t' << right_id
+	     << '\n';
 }
 
 size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue<unique_ptr<vector<Line>>> &queue)
@@ -266,8 +266,8 @@ int main(int argc, char *argv[])
 	
 	if (vm.count("help") || !vm.count("translated-tokens") || !vm.count("english-tokens")) {
 		cout << "Usage: " << argv[0]
-			 << " TRANSLATED-TOKENS ENGLISH-TOKENS\n\n"
-			 << generic_desc << endl;
+		     << " TRANSLATED-TOKENS ENGLISH-TOKENS\n\n"
+		     << generic_desc << std::endl;
 		return 1;
 	}
 
@@ -524,7 +524,7 @@ int main(int argc, char *argv[])
 
 		if (verbose)
 			cerr << "Read queue performance (Note: blocks when score queue fills up):\n" << read_queue.performance()
-				 << "Score queue performance:\n" << score_queue.performance();
+			     << "Score queue performance:\n" << score_queue.performance();
 	}
 
 	return 0;
