@@ -86,7 +86,7 @@ size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue
 		for (size_t i = 0; i < BATCH_SIZE; ++i) {
 			line_batch->push_back({
 				.str = string(it->data(), it->size()),
-				.n = document_count
+				.n = ++document_count
 			});
 
 			if (++it == end)
