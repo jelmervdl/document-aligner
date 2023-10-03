@@ -368,7 +368,7 @@ int main(int argc, char *argv[])
 
 					dest.reserve(dest.size() + entry.second.size());
 					
-					move(entry.second.begin(), entry.second.end(), back_inserter(dest));
+					std::move(entry.second.begin(), entry.second.end(), back_inserter(dest));
 				}
 			}
 		}));
