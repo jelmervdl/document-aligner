@@ -63,7 +63,7 @@ template <typename T> void stop(blocking_queue<unique_ptr<T>> &queue, vector<thr
 
 ostream &operator<<(ostream &out, queue_performance const &performance) {
 	return out << "  underflow: " << performance.underflow << '\n'
-			   << "   overflow: " << performance.overflow << '\n';
+	           << "   overflow: " << performance.overflow << '\n';
 }
 
 void print_score(float score, size_t left_id, size_t right_id)
@@ -75,7 +75,7 @@ void print_score(float score, size_t left_id, size_t right_id)
 		 << '\n';
 }
 
-size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
+size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue<unique_ptr<vector<Line>>> &queue)
 {
 	size_t document_count = 0;
 
@@ -84,12 +84,10 @@ size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue
 		line_batch->reserve(BATCH_SIZE);
 
 		for (size_t i = 0; i < BATCH_SIZE; ++i) {
-			if (document_count++ % skip_rate == 0) {
-				line_batch->push_back({
-					.str = string(it->data(), it->size()),
-					.n = document_count
-				});
-			}
+			line_batch->push_back({
+				.str = string(it->data(), it->size()),
+				.n = document_count
+			});
 
 			if (++it == end)
 				break;
@@ -101,10 +99,10 @@ size_t queue_lines(util::LineIterator it, util::LineIterator end, blocking_queue
 	return document_count;
 }
 
-size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Line>>> &queue, size_t skip_rate = 1)
+size_t queue_lines(std::string const &path, blocking_queue<unique_ptr<vector<Line>>> &queue)
 {
 	util::FilePiece fin(path.c_str());
-	return queue_lines(fin.begin(), fin.end(), queue, skip_rate);
+	return queue_lines(fin.begin(), fin.end(), queue);
 }
 
 constexpr size_t kCountingThreads = 16;
