@@ -437,9 +437,6 @@ int main(int argc, char *argv[])
 				unique_lock<mutex> lock(mark_score_mutex);
 				print_score(score, in_ref, en_ref);
 			};
-
-			// Print output header
-			cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 		}
 
 		vector<thread> score_workers(start(n_score_threads, [&score_queue, &ref_index, &threshold, &mark_score](size_t) {
@@ -469,6 +466,9 @@ int main(int argc, char *argv[])
 				}
 			}
 		}));
+
+		// Print output header
+		cout << "mt_doc_aligner_score\tidx_translated\tidx_trg" << endl;
 
 		size_t read_cnt = queue_lines(vm["english-tokens"].as<std::string>(), read_queue);
 
